@@ -23,6 +23,11 @@ type Server struct {
 	listener net.Listener
 }
 
+type connState struct {
+	inTransaction bool
+	queue         []resp.Value
+}
+
 func New(addr string, aofPath string) (*Server, error) {
 	a, err := aof.New(aofPath)
 	if err != nil {
@@ -96,6 +101,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	parser := resp.NewParser(conn)
 	writer := resp.NewWriter(conn)
+	state := &connState{}
 
 	for {
 		value, err := parser.Parse()
@@ -116,13 +122,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 		}
 
-		response := s.processCommand(value)
-
-		if s.isWriteCommand(value) {
-			if err := s.aof.Write(value); err != nil {
-				log.Printf("AOF write error: %v", err)
-			}
-		}
+		response := s.handleWithTransaction(value, state)
 
 		err = writer.Write(response)
 		if err != nil {
@@ -130,6 +130,78 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+func (s *Server) handleWithTransaction(value resp.Value, state *connState) resp.Value {
+	if value.Type != resp.ARRAY || len(value.Array) == 0 {
+		return errResponse("ERR invalid command format")
+	}
+
+	command := strings.ToUpper(value.Array[0].Bulk)
+
+	switch command {
+	case "MULTI":
+		return s.handleMulti(state)
+	case "EXEC":
+		return s.handleExec(state)
+	case "DISCARD":
+		return s.handleDiscard(state)
+	}
+
+	if state.inTransaction {
+		state.queue = append(state.queue, value)
+		return resp.Value{Type: resp.STRING, Str: "QUEUED"}
+	}
+
+	response := s.processCommand(value)
+
+	if s.isWriteCommand(value) {
+		if err := s.aof.Write(value); err != nil {
+			log.Printf("AOF write error: %v", err)
+		}
+	}
+
+	return response
+}
+
+func (s *Server) handleMulti(state *connState) resp.Value {
+	if state.inTransaction {
+		return errResponse("ERR MULTI calls can not be nested")
+	}
+	state.inTransaction = true
+	state.queue = []resp.Value{}
+	return okResponse()
+}
+
+func (s *Server) handleExec(state *connState) resp.Value {
+	if !state.inTransaction {
+		return errResponse("ERR EXEC without MULTI")
+	}
+
+	state.inTransaction = false
+	results := make([]resp.Value, len(state.queue))
+
+	for i, cmd := range state.queue {
+		results[i] = s.processCommand(cmd)
+
+		if s.isWriteCommand(cmd) {
+			if err := s.aof.Write(cmd); err != nil {
+				log.Printf("AOF write error: %v", err)
+			}
+		}
+	}
+
+	state.queue = []resp.Value{}
+	return resp.Value{Type: resp.ARRAY, Array: results}
+}
+
+func (s *Server) handleDiscard(state *connState) resp.Value {
+	if !state.inTransaction {
+		return errResponse("ERR DISCARD without MULTI")
+	}
+	state.inTransaction = false
+	state.queue = []resp.Value{}
+	return okResponse()
 }
 
 func (s *Server) handleSubscribe(args []resp.Value, writer *resp.Writer) {
