@@ -1,13 +1,12 @@
 package server
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"strings"
 
+	"github.com/AdeshDeshmukh/crimson/internal/resp"
 	"github.com/AdeshDeshmukh/crimson/internal/store"
 )
 
@@ -49,10 +48,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	clientAddr := conn.RemoteAddr().String()
 	log.Printf("Client connected: %s", clientAddr)
 
-	reader := bufio.NewReader(conn)
+	parser := resp.NewParser(conn)
+	writer := resp.NewWriter(conn)
 
 	for {
-		line, err := reader.ReadString('\n')
+		value, err := parser.Parse()
 		if err != nil {
 			if err == io.EOF {
 				log.Printf("Client disconnected: %s", clientAddr)
@@ -62,14 +62,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+		response := s.processCommand(value)
 
-		response := s.processCommand(line)
-
-		_, err = conn.Write([]byte(response + "\n"))
+		err = writer.Write(response)
 		if err != nil {
 			log.Printf("Error writing to %s: %v", clientAddr, err)
 			return
@@ -77,75 +72,72 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-func (s *Server) processCommand(line string) string {
-	parts := strings.Fields(line)
-	if len(parts) == 0 {
-		return "ERROR: empty command"
+func (s *Server) processCommand(value resp.Value) resp.Value {
+	if value.Type != resp.ARRAY || len(value.Array) == 0 {
+		return resp.Value{Type: resp.ERROR, Str: "ERR invalid command format"}
 	}
 
-	cmd := strings.ToUpper(parts[0])
-	args := parts[1:]
+	command := value.Array[0].Bulk
+	args := value.Array[1:]
 
-	switch cmd {
-	case "PING":
+	switch command {
+	case "ping", "PING":
 		return s.handlePing(args)
-	case "SET":
+	case "set", "SET":
 		return s.handleSet(args)
-	case "GET":
+	case "get", "GET":
 		return s.handleGet(args)
-	case "DEL":
+	case "del", "DEL":
 		return s.handleDel(args)
-	case "EXISTS":
+	case "exists", "EXISTS":
 		return s.handleExists(args)
 	default:
-		return fmt.Sprintf("ERROR: unknown command '%s'", cmd)
+		return resp.Value{Type: resp.ERROR, Str: fmt.Sprintf("ERR unknown command '%s'", command)}
 	}
 }
 
-func (s *Server) handlePing(args []string) string {
+func (s *Server) handlePing(args []resp.Value) resp.Value {
 	if len(args) == 0 {
-		return "PONG"
+		return resp.Value{Type: resp.STRING, Str: "PONG"}
 	}
-	return strings.Join(args, " ")
+	return resp.Value{Type: resp.STRING, Str: args[0].Bulk}
 }
 
-func (s *Server) handleSet(args []string) string {
+func (s *Server) handleSet(args []resp.Value) resp.Value {
 	if len(args) < 2 {
-		return "ERROR: SET requires key and value"
+		return resp.Value{Type: resp.ERROR, Str: "ERR SET requires key and value"}
 	}
-	key := args[0]
-	value := strings.Join(args[1:], " ")
-	s.store.Set(key, value)
-	return "OK"
+	s.store.Set(args[0].Bulk, args[1].Bulk)
+	return resp.Value{Type: resp.STRING, Str: "OK"}
 }
 
-func (s *Server) handleGet(args []string) string {
+func (s *Server) handleGet(args []resp.Value) resp.Value {
 	if len(args) < 1 {
-		return "ERROR: GET requires key"
+		return resp.Value{Type: resp.ERROR, Str: "ERR GET requires key"}
 	}
-	value, exists := s.store.Get(args[0])
+	value, exists := s.store.Get(args[0].Bulk)
 	if !exists {
-		return "nil"
+		return resp.Value{Type: resp.NULL}
 	}
-	return value
+	return resp.Value{Type: resp.BULK, Bulk: value}
 }
 
-func (s *Server) handleDel(args []string) string {
+func (s *Server) handleDel(args []resp.Value) resp.Value {
 	if len(args) < 1 {
-		return "ERROR: DEL requires key"
+		return resp.Value{Type: resp.ERROR, Str: "ERR DEL requires key"}
 	}
-	if s.store.Del(args[0]) {
-		return "1"
+	if s.store.Del(args[0].Bulk) {
+		return resp.Value{Type: resp.INTEGER, Num: 1}
 	}
-	return "0"
+	return resp.Value{Type: resp.INTEGER, Num: 0}
 }
 
-func (s *Server) handleExists(args []string) string {
+func (s *Server) handleExists(args []resp.Value) resp.Value {
 	if len(args) < 1 {
-		return "ERROR: EXISTS requires key"
+		return resp.Value{Type: resp.ERROR, Str: "ERR EXISTS requires key"}
 	}
-	if s.store.Exists(args[0]) {
-		return "1"
+	if s.store.Exists(args[0].Bulk) {
+		return resp.Value{Type: resp.INTEGER, Num: 1}
 	}
-	return "0"
+	return resp.Value{Type: resp.INTEGER, Num: 0}
 }
