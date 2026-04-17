@@ -33,34 +33,28 @@ func New(addr string, aofPath string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open AOF: %w", err)
 	}
-
 	s := &Server{
 		addr:   addr,
 		store:  store.New(),
 		aof:    a,
 		pubsub: pubsub.New(),
 	}
-
 	if err := s.loadAOF(); err != nil {
 		return nil, fmt.Errorf("failed to load AOF: %w", err)
 	}
-
 	return s, nil
 }
 
 func (s *Server) loadAOF() error {
 	log.Println("Loading AOF...")
-
 	count := 0
 	err := s.aof.Load(func(value resp.Value) {
 		s.processCommand(value)
 		count++
 	})
-
 	if err != nil {
 		return err
 	}
-
 	log.Printf("AOF loaded: %d commands replayed", count)
 	return nil
 }
@@ -80,9 +74,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 	s.listener = listener
-
 	log.Printf("Crimson server listening on %s", s.addr)
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -95,14 +87,11 @@ func (s *Server) Start() error {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
-
 	clientAddr := conn.RemoteAddr().String()
 	log.Printf("Client connected: %s", clientAddr)
-
 	parser := resp.NewParser(conn)
 	writer := resp.NewWriter(conn)
 	state := &connState{}
-
 	for {
 		value, err := parser.Parse()
 		if err != nil {
@@ -113,7 +102,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 			return
 		}
-
 		if value.Type == resp.ARRAY && len(value.Array) > 0 {
 			cmd := strings.ToUpper(value.Array[0].Bulk)
 			if cmd == "SUBSCRIBE" {
@@ -121,9 +109,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				return
 			}
 		}
-
 		response := s.handleWithTransaction(value, state)
-
 		err = writer.Write(response)
 		if err != nil {
 			log.Printf("Error writing to %s: %v", clientAddr, err)
@@ -136,9 +122,7 @@ func (s *Server) handleWithTransaction(value resp.Value, state *connState) resp.
 	if value.Type != resp.ARRAY || len(value.Array) == 0 {
 		return errResponse("ERR invalid command format")
 	}
-
 	command := strings.ToUpper(value.Array[0].Bulk)
-
 	switch command {
 	case "MULTI":
 		return s.handleMulti(state)
@@ -147,20 +131,16 @@ func (s *Server) handleWithTransaction(value resp.Value, state *connState) resp.
 	case "DISCARD":
 		return s.handleDiscard(state)
 	}
-
 	if state.inTransaction {
 		state.queue = append(state.queue, value)
 		return resp.Value{Type: resp.STRING, Str: "QUEUED"}
 	}
-
 	response := s.processCommand(value)
-
 	if s.isWriteCommand(value) {
 		if err := s.aof.Write(value); err != nil {
 			log.Printf("AOF write error: %v", err)
 		}
 	}
-
 	return response
 }
 
@@ -177,20 +157,16 @@ func (s *Server) handleExec(state *connState) resp.Value {
 	if !state.inTransaction {
 		return errResponse("ERR EXEC without MULTI")
 	}
-
 	state.inTransaction = false
 	results := make([]resp.Value, len(state.queue))
-
 	for i, cmd := range state.queue {
 		results[i] = s.processCommand(cmd)
-
 		if s.isWriteCommand(cmd) {
 			if err := s.aof.Write(cmd); err != nil {
 				log.Printf("AOF write error: %v", err)
 			}
 		}
 	}
-
 	state.queue = []resp.Value{}
 	return resp.Value{Type: resp.ARRAY, Array: results}
 }
@@ -209,18 +185,14 @@ func (s *Server) handleSubscribe(args []resp.Value, writer *resp.Writer) {
 		writer.Write(errResponse("ERR SUBSCRIBE requires channel name"))
 		return
 	}
-
 	channels := make([]string, len(args))
 	for i, arg := range args {
 		channels[i] = arg.Bulk
 	}
-
 	sub, confirmations := s.pubsub.Subscribe(channels)
-
 	for _, confirmation := range confirmations {
 		writer.Write(confirmation)
 	}
-
 	for {
 		message := s.pubsub.Receive(sub)
 		if err := writer.Write(message); err != nil {
@@ -233,9 +205,7 @@ func (s *Server) isWriteCommand(value resp.Value) bool {
 	if value.Type != resp.ARRAY || len(value.Array) == 0 {
 		return false
 	}
-
 	command := strings.ToUpper(value.Array[0].Bulk)
-
 	writeCommands := map[string]bool{
 		"SET":     true,
 		"DEL":     true,
@@ -252,8 +222,9 @@ func (s *Server) isWriteCommand(value resp.Value) bool {
 		"SREM":    true,
 		"HSET":    true,
 		"HDEL":    true,
+		"RENAME":  true,
+		"FLUSHDB": true,
 	}
-
 	return writeCommands[command]
 }
 
@@ -261,10 +232,8 @@ func (s *Server) processCommand(value resp.Value) resp.Value {
 	if value.Type != resp.ARRAY || len(value.Array) == 0 {
 		return errResponse("ERR invalid command format")
 	}
-
 	command := strings.ToUpper(value.Array[0].Bulk)
 	args := value.Array[1:]
-
 	switch command {
 	case "PING":
 		return s.handlePing(args)
@@ -324,12 +293,22 @@ func (s *Server) processCommand(value resp.Value) resp.Value {
 		return s.handleHExists(args)
 	case "PUBLISH":
 		return s.handlePublish(args)
+	case "KEYS":
+		return s.handleKeys(args)
+	case "SCAN":
+		return s.handleScan(args)
+	case "TYPE":
+		return s.handleType(args)
+	case "RENAME":
+		return s.handleRename(args)
+	case "DBSIZE":
+		return s.handleDBSize(args)
+	case "FLUSHDB":
+		return s.handleFlushDB(args)
 	default:
 		return errResponse(fmt.Sprintf("ERR unknown command '%s'", command))
 	}
 }
-
-// ─── Helpers ────────────────────────────────────────────────────
 
 func errResponse(msg string) resp.Value {
 	return resp.Value{Type: resp.ERROR, Str: msg}
@@ -351,8 +330,6 @@ func bulkResponse(s string) resp.Value {
 	return resp.Value{Type: resp.BULK, Bulk: s}
 }
 
-// ─── Pub/Sub Handlers ───────────────────────────────────────────
-
 func (s *Server) handlePublish(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR PUBLISH requires channel and message")
@@ -360,8 +337,6 @@ func (s *Server) handlePublish(args []resp.Value) resp.Value {
 	count := s.pubsub.Publish(args[0].Bulk, args[1].Bulk)
 	return intResponse(count)
 }
-
-// ─── String Handlers ────────────────────────────────────────────
 
 func (s *Server) handlePing(args []resp.Value) resp.Value {
 	if len(args) == 0 {
@@ -374,11 +349,9 @@ func (s *Server) handleSet(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR SET requires key and value")
 	}
-
 	key := args[0].Bulk
 	value := args[1].Bulk
 	var ttl time.Duration
-
 	for i := 2; i < len(args); i++ {
 		option := strings.ToUpper(args[i].Bulk)
 		switch option {
@@ -404,7 +377,6 @@ func (s *Server) handleSet(args []resp.Value) resp.Value {
 			i++
 		}
 	}
-
 	s.store.Set(key, value, ttl)
 	return okResponse()
 }
@@ -494,8 +466,6 @@ func (s *Server) handleMGet(args []resp.Value) resp.Value {
 	return resp.Value{Type: resp.ARRAY, Array: array}
 }
 
-// ─── TTL Handlers ───────────────────────────────────────────────
-
 func (s *Server) handleExpire(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR EXPIRE requires key and seconds")
@@ -527,8 +497,6 @@ func (s *Server) handlePersist(args []resp.Value) resp.Value {
 	}
 	return intResponse(0)
 }
-
-// ─── List Handlers ──────────────────────────────────────────────
 
 func (s *Server) handleLPush(args []resp.Value) resp.Value {
 	if len(args) < 2 {
@@ -624,8 +592,6 @@ func (s *Server) handleLLen(args []resp.Value) resp.Value {
 	return intResponse(length)
 }
 
-// ─── Set Handlers ───────────────────────────────────────────────
-
 func (s *Server) handleSAdd(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR SADD requires key and member")
@@ -697,8 +663,6 @@ func (s *Server) handleSCard(args []resp.Value) resp.Value {
 	}
 	return intResponse(count)
 }
-
-// ─── Hash Handlers ──────────────────────────────────────────────
 
 func (s *Server) handleHSet(args []resp.Value) resp.Value {
 	if len(args) < 3 || len(args)%2 == 0 {
@@ -774,4 +738,84 @@ func (s *Server) handleHExists(args []resp.Value) resp.Value {
 		return intResponse(1)
 	}
 	return intResponse(0)
+}
+
+func (s *Server) handleKeys(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return errResponse("ERR KEYS requires pattern")
+	}
+	keys := s.store.Keys(args[0].Bulk)
+	array := make([]resp.Value, len(keys))
+	for i, key := range keys {
+		array[i] = bulkResponse(key)
+	}
+	return resp.Value{Type: resp.ARRAY, Array: array}
+}
+
+func (s *Server) handleScan(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return errResponse("ERR SCAN requires cursor")
+	}
+	cursor, err := strconv.Atoi(args[0].Bulk)
+	if err != nil {
+		return errResponse("ERR cursor must be integer")
+	}
+	pattern := "*"
+	count := 10
+	for i := 1; i < len(args); i++ {
+		switch strings.ToUpper(args[i].Bulk) {
+		case "MATCH":
+			if i+1 < len(args) {
+				pattern = args[i+1].Bulk
+				i++
+			}
+		case "COUNT":
+			if i+1 < len(args) {
+				count, err = strconv.Atoi(args[i+1].Bulk)
+				if err != nil {
+					return errResponse("ERR COUNT must be integer")
+				}
+				i++
+			}
+		}
+	}
+	nextCursor, keys := s.store.Scan(cursor, pattern, count)
+	keyArray := make([]resp.Value, len(keys))
+	for i, key := range keys {
+		keyArray[i] = bulkResponse(key)
+	}
+	return resp.Value{
+		Type: resp.ARRAY,
+		Array: []resp.Value{
+			bulkResponse(strconv.Itoa(nextCursor)),
+			{Type: resp.ARRAY, Array: keyArray},
+		},
+	}
+}
+
+func (s *Server) handleType(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return errResponse("ERR TYPE requires key")
+	}
+	return resp.Value{Type: resp.STRING, Str: s.store.Type(args[0].Bulk)}
+}
+
+func (s *Server) handleRename(args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return errResponse("ERR RENAME requires key and newkey")
+	}
+	err := s.store.Rename(args[0].Bulk, args[1].Bulk)
+	if err != nil {
+		return errResponse("ERR no such key")
+	}
+	return okResponse()
+}
+
+func (s *Server) handleDBSize(args []resp.Value) resp.Value {
+	return intResponse(s.store.DBSize())
+}
+
+func (s *Server) handleFlushDB(args []resp.Value) resp.Value {
+	s.store.FlushDB()
+	return okResponse()
 }

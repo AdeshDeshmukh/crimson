@@ -1,5 +1,4 @@
 # In your crimson directory
-cat > README.md << 'EOF'
 <div align="center">
 
 # 🔴 Crimson
