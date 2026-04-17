@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AdeshDeshmukh/crimson/internal/aof"
+	"github.com/AdeshDeshmukh/crimson/internal/pubsub"
 	"github.com/AdeshDeshmukh/crimson/internal/resp"
 	"github.com/AdeshDeshmukh/crimson/internal/store"
 )
@@ -16,13 +18,54 @@ import (
 type Server struct {
 	addr     string
 	store    *store.Store
+	aof      *aof.AOF
+	pubsub   *pubsub.PubSub
 	listener net.Listener
 }
 
-func New(addr string) *Server {
-	return &Server{
-		addr:  addr,
-		store: store.New(),
+func New(addr string, aofPath string) (*Server, error) {
+	a, err := aof.New(aofPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open AOF: %w", err)
+	}
+
+	s := &Server{
+		addr:   addr,
+		store:  store.New(),
+		aof:    a,
+		pubsub: pubsub.New(),
+	}
+
+	if err := s.loadAOF(); err != nil {
+		return nil, fmt.Errorf("failed to load AOF: %w", err)
+	}
+
+	return s, nil
+}
+
+func (s *Server) loadAOF() error {
+	log.Println("Loading AOF...")
+
+	count := 0
+	err := s.aof.Load(func(value resp.Value) {
+		s.processCommand(value)
+		count++
+	})
+
+	if err != nil {
+		return err
+	}
+
+	log.Printf("AOF loaded: %d commands replayed", count)
+	return nil
+}
+
+func (s *Server) Close() {
+	if s.aof != nil {
+		s.aof.Close()
+	}
+	if s.listener != nil {
+		s.listener.Close()
 	}
 }
 
@@ -65,7 +108,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
+		if value.Type == resp.ARRAY && len(value.Array) > 0 {
+			cmd := strings.ToUpper(value.Array[0].Bulk)
+			if cmd == "SUBSCRIBE" {
+				s.handleSubscribe(value.Array[1:], writer)
+				return
+			}
+		}
+
 		response := s.processCommand(value)
+
+		if s.isWriteCommand(value) {
+			if err := s.aof.Write(value); err != nil {
+				log.Printf("AOF write error: %v", err)
+			}
+		}
 
 		err = writer.Write(response)
 		if err != nil {
@@ -73,6 +130,59 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+func (s *Server) handleSubscribe(args []resp.Value, writer *resp.Writer) {
+	if len(args) == 0 {
+		writer.Write(errResponse("ERR SUBSCRIBE requires channel name"))
+		return
+	}
+
+	channels := make([]string, len(args))
+	for i, arg := range args {
+		channels[i] = arg.Bulk
+	}
+
+	sub, confirmations := s.pubsub.Subscribe(channels)
+
+	for _, confirmation := range confirmations {
+		writer.Write(confirmation)
+	}
+
+	for {
+		message := s.pubsub.Receive(sub)
+		if err := writer.Write(message); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) isWriteCommand(value resp.Value) bool {
+	if value.Type != resp.ARRAY || len(value.Array) == 0 {
+		return false
+	}
+
+	command := strings.ToUpper(value.Array[0].Bulk)
+
+	writeCommands := map[string]bool{
+		"SET":     true,
+		"DEL":     true,
+		"INCR":    true,
+		"DECR":    true,
+		"MSET":    true,
+		"EXPIRE":  true,
+		"PERSIST": true,
+		"LPUSH":   true,
+		"RPUSH":   true,
+		"LPOP":    true,
+		"RPOP":    true,
+		"SADD":    true,
+		"SREM":    true,
+		"HSET":    true,
+		"HDEL":    true,
+	}
+
+	return writeCommands[command]
 }
 
 func (s *Server) processCommand(value resp.Value) resp.Value {
@@ -140,6 +250,8 @@ func (s *Server) processCommand(value resp.Value) resp.Value {
 		return s.handleHGetAll(args)
 	case "HEXISTS":
 		return s.handleHExists(args)
+	case "PUBLISH":
+		return s.handlePublish(args)
 	default:
 		return errResponse(fmt.Sprintf("ERR unknown command '%s'", command))
 	}
@@ -165,6 +277,16 @@ func nullResponse() resp.Value {
 
 func bulkResponse(s string) resp.Value {
 	return resp.Value{Type: resp.BULK, Bulk: s}
+}
+
+// ─── Pub/Sub Handlers ───────────────────────────────────────────
+
+func (s *Server) handlePublish(args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return errResponse("ERR PUBLISH requires channel and message")
+	}
+	count := s.pubsub.Publish(args[0].Bulk, args[1].Bulk)
+	return intResponse(count)
 }
 
 // ─── String Handlers ────────────────────────────────────────────
@@ -306,12 +428,10 @@ func (s *Server) handleExpire(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR EXPIRE requires key and seconds")
 	}
-
 	seconds, err := strconv.Atoi(args[1].Bulk)
 	if err != nil || seconds <= 0 {
 		return errResponse("ERR invalid expire time")
 	}
-
 	ok := s.store.SetExpiry(args[0].Bulk, time.Duration(seconds)*time.Second)
 	if ok {
 		return intResponse(1)

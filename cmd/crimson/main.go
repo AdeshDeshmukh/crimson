@@ -12,13 +12,14 @@ import (
 
 const (
 	Version = "0.1.0"
+	AOFPath = "crimson.aof"
 	Banner  = `
     ╔═══════════════════════════════════════╗
     ║                                       ║
-    ║        🔴  C R I M S O N  🔴           ║
+    ║        🔴  C R I M S O N  🔴         ║
     ║                                       ║
     ║   Redis-compatible data store in Go   ║
-    ║            Version %s                 ║
+    ║            Version %s              ║
     ║                                       ║
     ╚═══════════════════════════════════════╝
     `
@@ -27,7 +28,11 @@ const (
 func main() {
 	fmt.Printf(Banner, Version)
 
-	srv := server.New(":6379")
+	srv, err := server.New(":6379", AOFPath)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+	defer srv.Close()
 
 	go func() {
 		if err := srv.Start(); err != nil {
