@@ -307,3 +307,359 @@ func main() {
 │  Publisher → finds subscribers → broadcasts message         │
 │  Subscribers listen on Go channels (buffered, size 100)    │
 └─────────────────────────────────────────────────────────────┘
+
+📋 Supported Commands
+String Operations
+
+SET key value [EX seconds] [PX milliseconds]
+GET key
+DEL key
+EXISTS key
+INCR key
+DECR key
+MSET key1 value1 key2 value2 ...
+MGET key1 key2 key3 ...
+
+List Operations
+
+LPUSH key value [value ...]
+RPUSH key value [value ...]
+LPOP key
+RPOP key
+LRANGE key start stop
+LLEN key
+
+Set Operations
+
+SADD key member [member ...]
+SREM key member [member ...]
+SMEMBERS key
+SISMEMBER key member
+SCARD key
+
+Hash Operations
+
+HSET key field value [field value ...]
+HGET key field
+HDEL key field [field ...]
+HGETALL key
+HEXISTS key field
+
+TTL Operations
+
+EXPIRE key seconds
+TTL key
+PERSIST key
+
+Pub/Sub
+
+SUBSCRIBE channel [channel ...]
+PUBLISH channel message
+
+Transactions
+
+MULTI
+<commands...>
+EXEC
+DISCARD
+
+💡 Usage Examples
+Session Management
+
+# Set session with 30 minute expiry
+SET session:user123 "eyJhbGc..." EX 1800
+
+# Check remaining time
+TTL session:user123
+# (integer) 1799
+
+# Remove expiry
+PERSIST session:user123
+
+Real-time Chat
+
+# Terminal 1 - Subscriber
+SUBSCRIBE chat:room1
+
+# Terminal 2 - Publisher
+PUBLISH chat:room1 "Hello everyone!"
+# (integer) 1  ← number of subscribers
+
+# Terminal 1 receives:
+# 1) "message"
+# 2) "chat:room1"
+# 3) "Hello everyone!"
+
+Atomic Bank Transfer
+
+SET account:alice 1000
+SET account:bob 500
+
+MULTI
+DECR account:alice
+INCR account:bob
+EXEC
+
+# Both operations succeed or both fail
+# No partial transfers
+
+🔍 How It Works
+
+1. TCP Server
+
+// Accept connections on port 6379
+listener, _ := net.Listen("tcp", ":6379")
+
+for {
+    conn, _ := listener.Accept()
+    go handleConnection(conn)  // Each client in own goroutine
+}
+
+Why it matters: Handles thousands of concurrent clients efficiently using Go's lightweight goroutines.
+
+
+2. RESP Protocol
+Client sends:
+
+*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nAdesh\r\n
+
+Parser converts to:
+
+Value{
+    Type: ARRAY,
+    Array: [
+        {Type: BULK, Bulk: "SET"},
+        {Type: BULK, Bulk: "name"},
+        {Type: BULK, Bulk: "Adesh"},
+    ]
+}
+
+Server responds:
+
++OK\r\n
+
+Why it matters: Binary-safe protocol that can handle any data including nulls, newlines, and special characters.
+
+
+
+
+📁 Project Structure
+
+crimson/
+├── cmd/
+│   └── crimson/
+│       └── main.go              # Entry point, server startup
+├── internal/
+│   ├── aof/
+│   │   └── aof.go              # Append-only file persistence
+│   ├── pubsub/
+│   │   └── pubsub.go           # Publish/Subscribe system
+│   ├── resp/
+│   │   ├── parser.go           # RESP protocol parser
+│   │   └── writer.go           # RESP protocol writer
+│   ├── server/
+│   │   └── server.go           # TCP server, command routing
+│   └── store/
+│       └── store.go            # In-memory data structures
+├── docs/
+│   └── ARCHITECTURE.md         # Detailed architecture docs
+├── Makefile                    # Build automation
+├── go.mod                      # Go module definition
+├── README.md                   # This file
+├── LICENSE                     # MIT License
+└── crimson.aof                 # Persistence file (auto-created)
+
+
+
+🧪 Testing
+
+Manual Testing
+
+# Start server
+make run
+
+# In another terminal
+redis-cli -p 6379
+
+# Run commands
+PING
+SET test "value"
+GET test
+
+Automated Testing
+
+# Run all tests
+make test
+
+# Run with coverage
+make test-coverage
+
+# Run with race detector
+go test -race ./...
+
+Benchmarking
+
+# Using redis-benchmark
+redis-benchmark -p 6379 -t set,get -n 100000 -q
+
+# Custom benchmark
+make bench
+
+
+🗺️ Future Roadmap
+Phase 8: Advanced Commands
+ KEYS pattern - Pattern-based key search
+ SCAN cursor - Iterative key scanning
+ TYPE key - Get key type
+ RENAME key newkey - Rename keys
+ SORT - Sort list/set/hash values
+Phase 9: More Data Types
+ Sorted Sets - ZADD, ZRANGE, ZRANK, ZINCRBY
+ Bitmaps - SETBIT, GETBIT, BITCOUNT
+ HyperLogLog - PFADD, PFCOUNT, PFMERGE
+ Streams - XADD, XREAD, XRANGE
+Phase 10: Server Management
+ INFO - Server statistics
+ CONFIG GET/SET - Runtime configuration
+ DBSIZE - Number of keys
+ FLUSHDB - Clear database
+ SAVE / BGSAVE - Manual snapshots
+Phase 11: Advanced Features
+ RDB Snapshots - Point-in-time backups
+ Lua Scripting - EVAL, EVALSHA
+ Pipelining - Batch command execution
+ Blocking Operations - BLPOP, BRPOP
+ Geospatial - GEOADD, GEORADIUS
+Phase 12: Replication
+ Master-Replica setup
+ Asynchronous replication
+ Replica promotion
+ Read scaling
+Phase 13: Clustering
+ Data sharding across nodes
+ Hash slot allocation
+ Cluster discovery
+ Automatic failover
+Phase 14: Observability
+ Prometheus metrics export
+ Logging levels (debug, info, warn, error)
+ Slow log tracking
+ Connection pooling stats
+ Memory profiling
+Phase 15: Security
+ Password authentication (AUTH command)
+ ACL (Access Control Lists)
+ TLS/SSL support
+ Command renaming/disabling
+
+
+
+🤝 Contributing
+Contributions are welcome! Here's how you can help:
+
+Ways to Contribute
+Bug Reports - Found a bug? Open an issue
+Feature Requests - Have an idea? Suggest it
+Code Contributions - Submit a PR
+Documentation - Improve docs
+Testing - Add test cases
+
+
+Development Setup
+
+# Fork the repository
+git clone https://github.com/YOUR_USERNAME/crimson.git
+cd crimson
+
+# Create a branch
+git checkout -b feature/your-feature
+
+# Make changes
+# ...
+
+# Test
+make test
+
+# Commit
+git commit -m "feat: add awesome feature"
+
+# Push
+git push origin feature/your-feature
+
+# Open PR on GitHub
+
+
+📝 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+MIT License
+
+Copyright (c) 2026 Adesh Deshmukh
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+
+🙏 Acknowledgments
+Inspiration
+Redis - The amazing in-memory database this project emulates
+Build Your Own Redis - Excellent learning resource
+CodeCrafters - For the Redis challenge
+Anuj Bhaiya - For the guidance to build products, not just applications
+Learning Resources
+Redis Protocol Specification
+Redis Internals
+Designing Data-Intensive Applications by Martin Kleppmann
+Go Concurrency Patterns
+Tools & Libraries
+Go - The language that makes this possible
+redis-cli - For testing
+Homebrew - Package manager for macOS
+
+👨‍💻 Author
+Adesh Deshmukh
+
+🎓 B.Tech in Electronics & Telecommunications Engineering
+🏫 SGGS Institute of Engineering and Technology, Nanded
+💻 Passionate about Systems Programming, Databases, and Distributed Systems
+🏆 900+ problems solved across competitive programming platforms
+Connect:
+
+GitHub: @AdeshDeshmukh
+LinkedIn: Adesh Deshmukh
+LeetCode: Rating 1528
+Codeforces: Rating 1114
+Email: adeshkd123@gmail.com
+💬 Testimonials
+"Understanding Redis by building it from scratch is one of the best ways to learn database internals. Crimson demonstrates a deep understanding of systems programming."
+
+"The code is clean, well-structured, and professionally organized. Great learning resource for anyone wanting to understand how databases work."
+
+<div align="center">
+⭐ Star This Project
+If you found this helpful, please consider giving it a star!
+
+Built with ❤️ and lots of ☕ by Adesh Deshmukh
+
+⬆ Back to Top
+
+</div>
+🔗 Related Projects
+go-redis - Go Redis client
+redis - Official Redis source
+KeyDB - Multi-threaded Redis fork
+Dragonfly - Modern Redis alternative
+
+📚 Blog Posts
+Building Crimson: Part 1 - TCP Server
+Building Crimson: Part 2 - RESP Protocol
+Building Crimson: Part 3 - Concurrency
+Building Crimson: Part 4 - Persistence
