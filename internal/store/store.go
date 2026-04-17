@@ -4,12 +4,13 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"time"
 )
 
 var (
-	ErrKeyNotFound  = errors.New("key not found")
-	ErrWrongType    = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
-	ErrNotInteger   = errors.New("value is not an integer or out of range")
+	ErrKeyNotFound = errors.New("key not found")
+	ErrWrongType   = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
+	ErrNotInteger  = errors.New("ERR value is not an integer or out of range")
 )
 
 type Store struct {
@@ -17,29 +18,137 @@ type Store struct {
 	lists   map[string][]string
 	sets    map[string]map[string]bool
 	hashes  map[string]map[string]string
+	expiry  map[string]time.Time
 	mu      sync.RWMutex
 }
 
 func New() *Store {
-	return &Store{
+	s := &Store{
 		strings: make(map[string]string),
 		lists:   make(map[string][]string),
 		sets:    make(map[string]map[string]bool),
 		hashes:  make(map[string]map[string]string),
+		expiry:  make(map[string]time.Time),
 	}
+	go s.cleanupLoop()
+	return s
+}
+
+// ─── Expiry Core ────────────────────────────────────────────────
+
+func (s *Store) isExpired(key string) bool {
+	expireAt, exists := s.expiry[key]
+	if !exists {
+		return false
+	}
+	return time.Now().After(expireAt)
+}
+
+func (s *Store) deleteKey(key string) {
+	delete(s.strings, key)
+	delete(s.lists, key)
+	delete(s.sets, key)
+	delete(s.hashes, key)
+	delete(s.expiry, key)
+}
+
+func (s *Store) cleanupLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		for key := range s.expiry {
+			if s.isExpired(key) {
+				s.deleteKey(key)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// ─── TTL Commands ───────────────────────────────────────────────
+
+func (s *Store) SetExpiry(key string, duration time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, strExists := s.strings[key]
+	_, listExists := s.lists[key]
+	_, setExists := s.sets[key]
+	_, hashExists := s.hashes[key]
+
+	if !strExists && !listExists && !setExists && !hashExists {
+		return false
+	}
+
+	s.expiry[key] = time.Now().Add(duration)
+	return true
+}
+
+func (s *Store) TTL(key string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, strExists := s.strings[key]
+	_, listExists := s.lists[key]
+	_, setExists := s.sets[key]
+	_, hashExists := s.hashes[key]
+
+	keyExists := strExists || listExists || setExists || hashExists
+
+	if !keyExists {
+		return -2
+	}
+
+	expireAt, hasExpiry := s.expiry[key]
+	if !hasExpiry {
+		return -1
+	}
+
+	remaining := time.Until(expireAt)
+	if remaining <= 0 {
+		return -2
+	}
+
+	return int(remaining.Seconds())
+}
+
+func (s *Store) Persist(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, exists := s.expiry[key]
+	if exists {
+		delete(s.expiry, key)
+	}
+	return exists
 }
 
 // ─── String Commands ────────────────────────────────────────────
 
-func (s *Store) Set(key, value string) {
+func (s *Store) Set(key, value string, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.strings[key] = value
+
+	if ttl > 0 {
+		s.expiry[key] = time.Now().Add(ttl)
+	} else {
+		delete(s.expiry, key)
+	}
 }
 
 func (s *Store) Get(key string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return "", false
+	}
+
 	value, exists := s.strings[key]
 	return value, exists
 }
@@ -55,17 +164,18 @@ func (s *Store) Del(key string) bool {
 
 	exists := strExists || listExists || setExists || hashExists
 
-	delete(s.strings, key)
-	delete(s.lists, key)
-	delete(s.sets, key)
-	delete(s.hashes, key)
-
+	s.deleteKey(key)
 	return exists
 }
 
 func (s *Store) Exists(key string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return false
+	}
 
 	_, strExists := s.strings[key]
 	_, listExists := s.lists[key]
@@ -78,6 +188,10 @@ func (s *Store) Exists(key string) bool {
 func (s *Store) Incr(key string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
 
 	val, exists := s.strings[key]
 	if !exists {
@@ -98,6 +212,10 @@ func (s *Store) Incr(key string) (int, error) {
 func (s *Store) Decr(key string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
 
 	val, exists := s.strings[key]
 	if !exists {
@@ -125,11 +243,15 @@ func (s *Store) MSet(pairs []string) {
 }
 
 func (s *Store) MGet(keys []string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	values := make([]string, len(keys))
 	for i, key := range keys {
+		if s.isExpired(key) {
+			s.deleteKey(key)
+			continue
+		}
 		if val, exists := s.strings[key]; exists {
 			values[i] = val
 		}
@@ -142,6 +264,10 @@ func (s *Store) MGet(keys []string) []string {
 func (s *Store) LPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
@@ -158,6 +284,10 @@ func (s *Store) RPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
+
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
 	}
@@ -169,6 +299,11 @@ func (s *Store) RPush(key string, values ...string) (int, error) {
 func (s *Store) LPop(key string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return "", false, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return "", false, ErrWrongType
@@ -188,6 +323,11 @@ func (s *Store) RPop(key string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return "", false, nil
+	}
+
 	if _, exists := s.strings[key]; exists {
 		return "", false, ErrWrongType
 	}
@@ -203,8 +343,13 @@ func (s *Store) RPop(key string) (string, bool, error) {
 }
 
 func (s *Store) LRange(key string, start, stop int) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return []string{}, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return nil, ErrWrongType
@@ -223,7 +368,6 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 	if stop < 0 {
 		stop = length + stop
 	}
-
 	if start < 0 {
 		start = 0
 	}
@@ -238,8 +382,13 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 }
 
 func (s *Store) LLen(key string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return 0, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
@@ -253,6 +402,10 @@ func (s *Store) LLen(key string) (int, error) {
 func (s *Store) SAdd(key string, members ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
@@ -277,6 +430,11 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return 0, nil
+	}
+
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
 	}
@@ -293,8 +451,13 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 }
 
 func (s *Store) SIsMember(key, member string) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return false, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return false, ErrWrongType
@@ -304,8 +467,13 @@ func (s *Store) SIsMember(key, member string) (bool, error) {
 }
 
 func (s *Store) SMembers(key string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return []string{}, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return nil, ErrWrongType
@@ -320,8 +488,13 @@ func (s *Store) SMembers(key string) ([]string, error) {
 }
 
 func (s *Store) SCard(key string) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return 0, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
@@ -335,6 +508,10 @@ func (s *Store) SCard(key string) (int, error) {
 func (s *Store) HSet(key string, fields map[string]string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
@@ -356,8 +533,13 @@ func (s *Store) HSet(key string, fields map[string]string) (int, error) {
 }
 
 func (s *Store) HGet(key, field string) (string, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return "", false, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return "", false, ErrWrongType
@@ -376,6 +558,11 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return 0, nil
+	}
+
 	if _, exists := s.strings[key]; exists {
 		return 0, ErrWrongType
 	}
@@ -392,8 +579,13 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 }
 
 func (s *Store) HGetAll(key string) (map[string]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return map[string]string{}, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return nil, ErrWrongType
@@ -413,8 +605,13 @@ func (s *Store) HGetAll(key string) (map[string]string, error) {
 }
 
 func (s *Store) HExists(key, field string) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.isExpired(key) {
+		s.deleteKey(key)
+		return false, nil
+	}
 
 	if _, exists := s.strings[key]; exists {
 		return false, ErrWrongType

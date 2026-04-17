@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AdeshDeshmukh/crimson/internal/resp"
 	"github.com/AdeshDeshmukh/crimson/internal/store"
@@ -101,6 +102,12 @@ func (s *Server) processCommand(value resp.Value) resp.Value {
 		return s.handleMSet(args)
 	case "MGET":
 		return s.handleMGet(args)
+	case "EXPIRE":
+		return s.handleExpire(args)
+	case "TTL":
+		return s.handleTTL(args)
+	case "PERSIST":
+		return s.handlePersist(args)
 	case "LPUSH":
 		return s.handleLPush(args)
 	case "RPUSH":
@@ -173,7 +180,38 @@ func (s *Server) handleSet(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return errResponse("ERR SET requires key and value")
 	}
-	s.store.Set(args[0].Bulk, args[1].Bulk)
+
+	key := args[0].Bulk
+	value := args[1].Bulk
+	var ttl time.Duration
+
+	for i := 2; i < len(args); i++ {
+		option := strings.ToUpper(args[i].Bulk)
+		switch option {
+		case "EX":
+			if i+1 >= len(args) {
+				return errResponse("ERR EX requires a value")
+			}
+			seconds, err := strconv.Atoi(args[i+1].Bulk)
+			if err != nil || seconds <= 0 {
+				return errResponse("ERR invalid EX value")
+			}
+			ttl = time.Duration(seconds) * time.Second
+			i++
+		case "PX":
+			if i+1 >= len(args) {
+				return errResponse("ERR PX requires a value")
+			}
+			millis, err := strconv.Atoi(args[i+1].Bulk)
+			if err != nil || millis <= 0 {
+				return errResponse("ERR invalid PX value")
+			}
+			ttl = time.Duration(millis) * time.Millisecond
+			i++
+		}
+	}
+
+	s.store.Set(key, value, ttl)
 	return okResponse()
 }
 
@@ -262,6 +300,42 @@ func (s *Server) handleMGet(args []resp.Value) resp.Value {
 	return resp.Value{Type: resp.ARRAY, Array: array}
 }
 
+// ─── TTL Handlers ───────────────────────────────────────────────
+
+func (s *Server) handleExpire(args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return errResponse("ERR EXPIRE requires key and seconds")
+	}
+
+	seconds, err := strconv.Atoi(args[1].Bulk)
+	if err != nil || seconds <= 0 {
+		return errResponse("ERR invalid expire time")
+	}
+
+	ok := s.store.SetExpiry(args[0].Bulk, time.Duration(seconds)*time.Second)
+	if ok {
+		return intResponse(1)
+	}
+	return intResponse(0)
+}
+
+func (s *Server) handleTTL(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return errResponse("ERR TTL requires key")
+	}
+	return intResponse(s.store.TTL(args[0].Bulk))
+}
+
+func (s *Server) handlePersist(args []resp.Value) resp.Value {
+	if len(args) < 1 {
+		return errResponse("ERR PERSIST requires key")
+	}
+	if s.store.Persist(args[0].Bulk) {
+		return intResponse(1)
+	}
+	return intResponse(0)
+}
+
 // ─── List Handlers ──────────────────────────────────────────────
 
 func (s *Server) handleLPush(args []resp.Value) resp.Value {
@@ -328,22 +402,18 @@ func (s *Server) handleLRange(args []resp.Value) resp.Value {
 	if len(args) < 3 {
 		return errResponse("ERR LRANGE requires key start stop")
 	}
-
 	start, err := strconv.Atoi(args[1].Bulk)
 	if err != nil {
 		return errResponse("ERR start is not an integer")
 	}
-
 	stop, err := strconv.Atoi(args[2].Bulk)
 	if err != nil {
 		return errResponse("ERR stop is not an integer")
 	}
-
 	values, err := s.store.LRange(args[0].Bulk, start, stop)
 	if err != nil {
 		return errResponse(err.Error())
 	}
-
 	array := make([]resp.Value, len(values))
 	for i, val := range values {
 		array[i] = bulkResponse(val)
